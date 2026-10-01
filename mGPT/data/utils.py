@@ -38,8 +38,10 @@ def humanml3d_collate(batch):
     # Motion only
     adapted_batch = {
         "motion":
-        collate_tensors([torch.tensor(b[1]).float() for b in notnone_batches]),
+        collate_tensors([b[1].float() for b in notnone_batches]),
         "length": [b[2] for b in notnone_batches],
+        "src": [b[9] for b in notnone_batches],
+        "name": [b[3] for b in notnone_batches]
     }
 
     # Text and motion
@@ -65,7 +67,7 @@ def humanml3d_collate(batch):
         })
 
     # Tasks
-    if len(notnone_batches[0]) == 9:
+    if len(notnone_batches[0]) >= 9:
         adapted_batch.update({"tasks": [b[8] for b in notnone_batches]})
 
     return adapted_batch

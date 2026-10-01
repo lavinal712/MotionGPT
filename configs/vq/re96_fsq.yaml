@@ -1,0 +1,13 @@
+target: mGPT.archs.mgpt_vq.FSQVae
+params:
+  levels: [6,4,4]
+  code_num: 96
+  down_t: 2
+  stride_t: 2
+  width: 512
+  depth: 3
+  dilation_growth_rate: 3
+  norm: None
+  activation: 'relu'
+  nfeats: 43
+  ablation: ${ABLATION}

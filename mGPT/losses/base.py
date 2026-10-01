@@ -23,10 +23,14 @@ class BaseLosses(nn.Module):
         for loss in losses[:-1]:
             self._losses_func[loss] = losses_func[loss](reduction='mean')
             
-    def _update_loss(self, loss: str, outputs, inputs):
+    def _update_loss(self, loss: str, outputs, inputs, length=None):
         '''Update the loss and return the weighted loss.'''
+        # print(loss, inputs.shape, outputs.shape)
         # Update the loss
-        val = self._losses_func[loss](outputs, inputs)
+        if loss == 'recons_feature':
+            val = self._losses_func[loss](outputs, inputs, length=length)
+        else:
+            val = self._losses_func[loss](outputs, inputs)
         # self.losses_values[loss] += val.detach()
         getattr(self, loss).add_(val.detach())
         # Return a weighted sum

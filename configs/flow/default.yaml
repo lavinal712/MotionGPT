@@ -1,0 +1,12 @@
+target: mGPT.archs.mgpt_flow.FlowMatchingHead
+params:
+  latent_dim: 48
+  condition_dim: 768
+
+  hidden_dim: 1792
+  num_layers: 9
+  mlp_ratio: 1.0
+
+  frequency_dim: 256
+  time_scale: 1000.0
+  norm_eps: 1e-6

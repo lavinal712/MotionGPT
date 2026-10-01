@@ -3,6 +3,8 @@ import scipy.linalg
 import torch
 from torch import linalg
 import sys
+from mGPT.utils.human_models import get_coord
+from mGPT.metrics import Rouge, sacrebleu
 
 
 def l2_norm(x1, x2, dim):
@@ -605,3 +607,34 @@ def calculate_kid(real_activations, generated_activations):
                                          n_subsets=100)
     results = (kid_values[0].mean(), kid_values[0].std())
     return results
+
+
+def bleu(references, hypotheses, level='word'):
+    """
+    Raw corpus BLEU from sacrebleu (without tokenization)
+    :param hypotheses: list of hypotheses (strings)
+    :param references: list of references (strings)
+    :return:
+    """
+    if level=='char':
+        #split word
+        references = [' '.join(list(r)) for r in references]
+        hypotheses = [' '.join(list(r)) for r in hypotheses]
+    bleu_scores = sacrebleu.raw_corpus_bleu(
+        sys_stream=hypotheses, ref_streams=[references]
+    ).scores
+    scores = {}
+    for n in range(len(bleu_scores)):
+        scores["bleu" + str(n + 1)] = bleu_scores[n]
+    return scores
+
+
+def rouge(references, hypotheses, level='word'):
+    if level=='char':
+        hyp = [list(x) for x in hypotheses]
+        ref = [list(x) for x in references]
+    else:
+        hyp = [x.split() for x in hypotheses]
+        ref = [x.split() for x in references]
+    a = Rouge.rouge([' '.join(x) for x in hyp], [' '.join(x) for x in ref])
+    return a['rouge_l/f_score']*100

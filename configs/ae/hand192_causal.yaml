@@ -1,0 +1,12 @@
+target: mGPT.archs.mgpt_ae.AutoencoderKL
+params:
+  nfeats: 45
+  latent_dim: 16
+  down_t: 2
+  stride_t: 2
+  width: 512
+  depth: 3
+  dilation_growth_rate: 3
+  norm: null
+  activation: relu
+  is_causal: true

@@ -1,0 +1,135 @@
+NAME: STREAM_CLASSIFIER
+DEBUG: false
+FULL_CONFIG: false
+
+ACCELERATOR: gpu
+NUM_NODES: 1
+DEVICE: [0,1,2,3,4,5]
+SEED_VALUE: 1234
+
+TRAIN:
+  STAGE: stream
+  SPLIT: train
+
+  # Start with a small batch: stream preserves full motion sequences.
+  BATCH_SIZE: 8
+  NUM_WORKERS: 4
+  END_EPOCH: 100
+
+  RESUME: ""
+  PRETRAINED: ""
+
+  # StreamModel loads its three VAE branches itself.
+  PRETRAINED_VAE: ""
+
+  OPTIM:
+    target: AdamW
+    params:
+      lr: 1e-4
+      betas: [0.9, 0.99]
+      weight_decay: 0.01
+
+  LR_SCHEDULER:
+    target: CosineAnnealingLR
+    params:
+      T_max: ${TRAIN.END_EPOCH}
+      eta_min: 1e-6
+
+EVAL:
+  SPLIT: val
+  BATCH_SIZE: 4
+  NUM_WORKERS: 4
+
+TEST:
+  CHECKPOINTS: ""
+  SPLIT: test
+  BATCH_SIZE: 4
+  NUM_WORKERS: 4
+  REPLICATION_TIMES: 1
+  SAVE_PREDICTIONS: false
+
+DATASET:
+  target: mGPT.data.H2S.H2SDataModule
+
+  H2S:
+    DATASET_NAME: how2sign_csl_phoenix
+
+    ROOT: /aiarena/group/gmgroup/hongyq/workspace/SOKE/data/How2Sign
+    CSL_ROOT: /aiarena/group/gmgroup/hongyq/workspace/SOKE/data/CSL-Daily
+    PHOENIX_ROOT: /aiarena/group/gmgroup/hongyq/workspace/SOKE/data/Phoenix_2014T
+
+    # Must match the trained VAE's normalization.
+    MEAN_PATH: /aiarena/group/gmgroup/hongyq/workspace/SOKE/data/CSL-Daily/mean.pt
+    STD_PATH: /aiarena/group/gmgroup/hongyq/workspace/SOKE/data/CSL-Daily/std.pt
+
+    # Retained for dataset constructor compatibility.
+    # The stream branch no longer resizes motion to these limits.
+    MAX_MOTION_LEN: 400
+    MIN_MOTION_LEN: 40
+    UNIT_LEN: 4
+
+    MAX_TEXT_LEN: 128
+    PICK_ONE_TEXT: true
+    STD_TEXT: false
+
+    # Metadata only; does not resample the source poses.
+    FRAME_RATE: 20.0
+
+LOSS:
+  LAMBDA_FLOW: 1.0
+  LAMBDA_END: 0.1
+
+METRIC:
+  # First validate training with flow loss only.
+  TYPE: ['TM2TMetrics']
+
+LOGGER:
+  TYPE: ['wandb']
+  VAL_EVERY_STEPS: 10  #10
+  WANDB:
+    params:
+      project: SLG
+
+stream_params:
+  stage: ${TRAIN.STAGE}
+  task: t2m
+  debug: ${DEBUG}
+  metrics_dict: ${METRIC.TYPE}
+
+  generator: ${lm.stream}
+  flow_head: ${flow.default}
+
+  motion_vae: ${ae.re96_causal}
+  hand_vae_cfg: ${ae.hand192_causal}
+  rhand_vae_cfg: ${ae.hand192_causal}
+
+  vae_checkpoint: /aiarena/group/gmgroup/hongyq/workspace/MotionGPT-lavinal712/experiments/mgpt/AUTOENCODERKL_CAUSAL/checkpoints/min-how2sign_MPJPE_PA_handepoch=499.ckpt
+
+  # Hugging Face model ID, or replace with a local checkpoint directory.
+  text_model_path: /aiarena/group/gmgroup/hongyq/workspace/MotionGPT-lavinal712/deps/mt5-base
+  max_text_length: 128
+
+  # Required: determine the END reference before starting training.
+  end_latent: null
+  end_threshold: 0.1
+  end_mode: classifier  # latent, classifier, or either (OR)
+  end_prob_threshold: 0.5
+
+  time_sampling: logit_normal
+  num_time_samples: 1
+
+  # Train the text-free branch before enabling guidance > 1 at inference.
+  # 1.0 preserves ordinary conditional sampling without a second branch.
+  text_dropout_prob: 0.1
+  guidance_scale: 1.0
+
+  num_flow_steps: 16
+  min_new_tokens: 1
+
+  # Initial inference cap, not a training-length restriction.
+  # Revisit after measuring the actual motion-length distribution.
+  max_new_tokens: 256
+
+model:
+  target: mGPT.models.mgpt_stream.StreamModel
+  params: ${stream_params}

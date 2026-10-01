@@ -7,6 +7,7 @@ from torchmetrics.functional import pairwise_euclidean_distance
 from .utils import *
 import os
 from mGPT.config import instantiate_from_config
+from mGPT.utils.misc import neq_load_customized
 
 class MMMetrics(Metric):
     full_state_update = True
@@ -55,8 +56,9 @@ class MMMetrics(Metric):
                                     map_location="cpu")
 
         self.t2m_textencoder.load_state_dict(t2m_checkpoint["text_encoder"])
-        self.t2m_moveencoder.load_state_dict(
-            t2m_checkpoint["movement_encoder"])
+        # self.t2m_moveencoder.load_state_dict(
+        #     t2m_checkpoint["movement_encoder"])
+        neq_load_customized(self.t2m_moveencoder, t2m_checkpoint["movement_encoder"])
         self.t2m_motionencoder.load_state_dict(
             t2m_checkpoint["motion_encoder"])
 

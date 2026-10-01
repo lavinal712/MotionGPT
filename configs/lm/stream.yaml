@@ -1,0 +1,16 @@
+target: mGPT.archs.mgpt_stream.StreamGenerator
+params:
+  latent_dim: 48
+  text_dim: 768
+
+  hidden_dim: 768
+  num_layers: 12
+  num_heads: 12
+  intermediate_dim: 2048
+
+  num_languages: 3
+
+  dropout: 0.0
+  qk_norm: true
+  rope_base: 10000.0
+  norm_eps: 1e-6

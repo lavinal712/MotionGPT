@@ -93,7 +93,12 @@ def parse_args(phase="train"):
         default=cfg_defualt,
         help="config file",
     )
-
+    group.add_argument("--use_gpus",
+                           type=str,
+                           required=False,
+                           default='2,3,4,5,6,7',
+                           help="cuda environ devices")
+    
     # Parse for each phase
     if phase in ["train", "test"]:
         group.add_argument("--batch_size",
@@ -136,6 +141,13 @@ def parse_args(phase="train"):
             required=False,
             help="output dir",
         )
+        group.add_argument(
+            "--demo_dataset",
+            default=None,
+            type=str,
+            required=False,
+            help="output dir",
+        )
 
     if phase == "render":
         group.add_argument("--npy",
@@ -172,6 +184,7 @@ def parse_args(phase="train"):
         cfg_exp = get_module_config(cfg_exp, cfg_assets.CONFIG_FOLDER)
     cfg = OmegaConf.merge(cfg_exp, cfg_assets)
 
+    cfg.USE_GPUS = params.use_gpus
     # Update config with arguments
     if phase in ["train", "test"]:
         cfg.TRAIN.BATCH_SIZE = params.batch_size if params.batch_size else cfg.TRAIN.BATCH_SIZE
@@ -183,10 +196,11 @@ def parse_args(phase="train"):
         # Force no debug in test
         if phase == "test":
             cfg.DEBUG = False
-            cfg.DEVICE = [0]
-            print("Force no debugging and one gpu when testing")
+            # cfg.DEVICE = [0]
+            print("Force no debugging when testing")
 
     if phase == "demo":
+        cfg.DEMO_DATASET = params.demo_dataset
         cfg.DEMO.EXAMPLE = params.example
         cfg.DEMO.TASK = params.task
         cfg.TEST.FOLDER = params.out_dir if params.out_dir else cfg.TEST.FOLDER

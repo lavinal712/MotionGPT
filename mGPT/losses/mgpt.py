@@ -1,6 +1,15 @@
 import torch
 import torch.nn as nn
 from .base import BaseLosses
+import torch.nn.functional as F
+
+
+def create_mask(length, device):
+    b_size = len(length)
+    mask = torch.zeros(b_size, max(length), 1).to(device)
+    for i, l in enumerate(length):
+        mask[i, :l, 0] = 1
+    return mask  #[B,maxT,1]
 
 
 class CommitLoss(nn.Module):
@@ -14,12 +23,35 @@ class CommitLoss(nn.Module):
         return commit
 
 
+class SmoothL1LossWithMask(nn.Module):
+    def __init__(self, **kwargs):
+        super().__init__()
+    
+    def forward(self, pred, target, length=None):
+        if length is not None:
+            # mask paddings
+            mask = create_mask(length, pred.device)
+            pred = pred*mask
+            target = target*mask
+        else:
+            return F.smooth_l1_loss(pred, target)
+        lengths = torch.as_tensor(length, device=pred.device)
+        valid = torch.arange(pred.shape[1], device=pred.device)[None] < lengths[:, None]
+        return F.smooth_l1_loss(pred[valid], target[valid])
+
+
 class GPTLosses(BaseLosses):
     
     def __init__(self, cfg, stage, num_joints, **kwargs):
         # Save parameters
         self.stage = stage
         recons_loss = cfg.LOSS.ABLATION.RECONS_LOSS
+
+        self.is_continuous_vae = (
+            stage == "vae"
+            and cfg.model.params.motion_vae.target.split(".")[-1]
+            == "AutoencoderKL"
+        )
 
         # Define losses
         losses = []
@@ -31,11 +63,19 @@ class GPTLosses(BaseLosses):
             losses.append("recons_velocity")
             params['recons_velocity'] = cfg.LOSS.LAMBDA_VELOCITY
 
-            losses.append("vq_commit")
-            params['vq_commit'] = cfg.LOSS.LAMBDA_COMMIT
+            if self.is_continuous_vae:
+                losses.append("kl_loss")
+                params["kl_loss"] = cfg.LOSS.LAMBDA_KL
+            else:
+                losses.append("vq_commit")
+                params["vq_commit"] = cfg.LOSS.LAMBDA_COMMIT
         elif stage in ["lm_pretrain", "lm_instruct"]:
             losses.append("gpt_loss")
             params['gpt_loss'] = cfg.LOSS.LAMBDA_CLS
+            losses.append("gpthand_loss")
+            params['gpthand_loss'] = cfg.LOSS.LAMBDA_CLS
+            losses.append("gptrhand_loss")
+            params['gptrhand_loss'] = cfg.LOSS.LAMBDA_CLS
 
         # Define loss functions & weights
         losses_func = {}
@@ -46,7 +86,8 @@ class GPTLosses(BaseLosses):
                 elif recons_loss == "l2":
                     losses_func[loss] = nn.MSELoss
                 elif recons_loss == "l1_smooth":
-                    losses_func[loss] = nn.SmoothL1Loss
+                    # losses_func[loss] = nn.SmoothL1Loss
+                    losses_func[loss] = SmoothL1LossWithMask
             elif loss.split('_')[1] in [
                     'commit', 'loss', 'gpt', 'm2t2m', 't2m2t'
             ]:
@@ -65,7 +106,7 @@ class GPTLosses(BaseLosses):
 
         if self.stage in ["vae"]:
             total += self._update_loss("recons_feature", rs_set['m_rst'],
-                                       rs_set['m_ref'])
+                                       rs_set['m_ref'], rs_set['length'])
             # total += self._update_loss("recons_joints", rs_set['joints_rst'], rs_set['joints_ref'])
             nfeats = rs_set['m_rst'].shape[-1]
             if nfeats in [263, 135 + 263]:
@@ -83,12 +124,31 @@ class GPTLosses(BaseLosses):
                 if self._params['recons_velocity'] != 0.0:
                     raise NotImplementedError(
                         "Velocity not implemented for nfeats = {})".format(nfeats))
-            total += self._update_loss("vq_commit", rs_set['loss_commit'],
-                                       rs_set['loss_commit'])
+            if self.is_continuous_vae:
+                total += self._update_loss(
+                    "kl_loss",
+                    rs_set["loss_kl"],
+                    rs_set["loss_kl"],
+                )
+            else:
+                total += self._update_loss(
+                    "vq_commit",
+                    rs_set["loss_commit"],
+                    rs_set["loss_commit"],
+                )
 
         if self.stage in ["lm_pretrain", "lm_instruct"]:
-            total += self._update_loss("gpt_loss", rs_set['outputs'].loss,
-                                       rs_set['outputs'].loss)
+            if type(rs_set['outputs']) == dict:
+                total += self._update_loss("gpt_loss", rs_set['outputs']['loss'],
+                                       rs_set['outputs']['loss'])
+                total += self._update_loss("gpthand_loss", rs_set['outputs']['loss_hand'],
+                                       rs_set['outputs']['loss_hand'])
+                if rs_set['outputs']['loss_rhand'] is not None:
+                    total += self._update_loss("gptrhand_loss", rs_set['outputs']['loss_rhand'],
+                                       rs_set['outputs']['loss_rhand'])
+            else:
+                total += self._update_loss("gpt_loss", rs_set['outputs'].loss,
+                                        rs_set['outputs'].loss)
 
         # Update the total loss
         self.total += total.detach()

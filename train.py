@@ -2,6 +2,7 @@ import os
 import glob
 import torch
 import pytorch_lightning as pl
+from pytorch_lightning.strategies import DDPStrategy
 from omegaconf import OmegaConf
 from mGPT.callback import build_callbacks
 from mGPT.config import parse_args, instantiate_from_config
@@ -13,6 +14,8 @@ from mGPT.utils.load_checkpoint import load_pretrained, load_pretrained_vae
 def main():
     # Configs
     cfg = parse_args(phase="train")  # parse config file
+    os.environ['CUDA_VISIBLE_DEVICES'] = cfg.USE_GPUS
+    # print(cfg)
 
     # Logger
     logger = create_logger(cfg, phase="train")  # create logger
@@ -56,10 +59,11 @@ def main():
         accelerator=cfg.ACCELERATOR,
         devices=cfg.DEVICE,
         num_nodes=cfg.NUM_NODES,
-        strategy="ddp_find_unused_parameters_true"
-        if len(cfg.DEVICE) > 1 else 'auto',
+        strategy="ddp_find_unused_parameters_true" if len(cfg.DEVICE) > 1 else 'auto',
+        # strategy=DDPStrategy(process_group_backend="nccl"),
         benchmark=False,
         deterministic=False,
+        # num_sanity_val_steps=0,  #for debug
     )
     logger.info("Trainer initialized")
 
@@ -76,6 +80,7 @@ def main():
     #     model = torch.compile(model, mode="reduce-overhead")
     # model = torch.compile(model)
 
+    print('tmax: ', cfg.TRAIN.LR_SCHEDULER.params.T_max)
     # Lightning Fitting
     if cfg.TRAIN.RESUME:
         trainer.fit(model,
