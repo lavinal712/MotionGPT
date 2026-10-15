@@ -189,10 +189,30 @@ class FlowMatchingHead(nn.Module):
 
         dtype = self.input_proj.weight.dtype
 
-        hidden = self.input_proj(noisy_latents.to(dtype))
         context = (
             self.time_embed(timesteps)
             + self.condition_proj(condition.to(dtype))
+        )
+        return self.forward_with_context(noisy_latents, context)
+
+    def forward_with_context(
+        self,
+        noisy_latents: Tensor,
+        context: Tensor,
+    ) -> Tensor:
+        """Evaluate velocity with an already prepared time/condition context."""
+        if (
+            noisy_latents.ndim != 2
+            or noisy_latents.shape[-1] != self.latent_dim
+        ):
+            raise ValueError("noisy_latents must be [N, latent_dim].")
+        if context.shape != (
+            noisy_latents.shape[0], self.input_proj.out_features
+        ):
+            raise ValueError("context must be [N, hidden_dim].")
+
+        hidden = self.input_proj(
+            noisy_latents.to(self.input_proj.weight.dtype)
         )
 
         for block in self.blocks:

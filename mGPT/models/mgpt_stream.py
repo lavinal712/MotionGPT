@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
@@ -36,6 +38,13 @@ class StreamModel(BaseModel):
         guidance_scale=1.0,
         end_mode="latent",
         end_prob_threshold=0.5,
+        two_forward_max_ratio=0.0,
+        two_forward_warmup_steps=10000,
+        two_forward_steps=4,
+        two_forward_chunk_size=256,
+        latent_pack_size=1,
+        df_noise_levels=(),
+        df_noise_warmup_steps=10000,
     ):
         self.save_hyperparameters(ignore="datamodule", logger=False)
         self.datamodule = datamodule
@@ -53,10 +62,36 @@ class StreamModel(BaseModel):
             raise ValueError("end_prob_threshold must be in (0, 1).")
         if num_time_samples < 1 or num_flow_steps < 1:
             raise ValueError("Flow sample counts must be positive.")
+        if not 0 <= two_forward_max_ratio <= 1:
+            raise ValueError("two_forward_max_ratio must be in [0, 1].")
+        if (
+            not isinstance(two_forward_warmup_steps, int)
+            or two_forward_warmup_steps < 0
+            or not isinstance(two_forward_steps, int)
+            or two_forward_steps < 1
+            or not isinstance(two_forward_chunk_size, int)
+            or two_forward_chunk_size < 1
+        ):
+            raise ValueError("Invalid Two-Forward step or chunk counts.")
         if not 1 <= min_new_tokens <= max_new_tokens:
             raise ValueError(
                 "Require 1 <= min_new_tokens <= max_new_tokens."
             )
+        if not isinstance(latent_pack_size, int) or latent_pack_size < 1:
+            raise ValueError("latent_pack_size must be a positive integer.")
+        levels = tuple(float(level) for level in df_noise_levels)
+        if levels and (
+            0.0 not in levels
+            or max(levels) <= 0
+            or any(not 0 <= level <= 1 for level in levels)
+        ):
+            raise ValueError("DF noise levels must include 0 and a positive level, all within [0, 1].")
+        if not isinstance(df_noise_warmup_steps, int) or df_noise_warmup_steps < 0:
+            raise ValueError("df_noise_warmup_steps must be a nonnegative integer.")
+        self.register_buffer(
+            "_df_noise_levels", torch.tensor(levels, dtype=torch.float32),
+            persistent=False,
+        )
 
         # Frozen motion VAEs.
         self.vae = instantiate_from_config(motion_vae)
@@ -111,17 +146,23 @@ class StreamModel(BaseModel):
         self.text_encoder.requires_grad_(False).eval()
 
         # Trainable networks.
+        if levels:
+            generator = dict(generator)
+            generator["params"] = dict(generator.get("params", {}))
+            generator["params"]["history_noise_conditioning"] = True
         self.generator = instantiate_from_config(generator)
         self.flow_head = instantiate_from_config(flow_head)
 
         latent_dim = sum(self.latent_dims)
+        packed_dim = latent_dim * latent_pack_size
 
         if (
-            self.generator.latent_dim != latent_dim
-            or self.flow_head.latent_dim != latent_dim
+            self.generator.latent_dim != packed_dim
+            or self.flow_head.latent_dim != packed_dim
         ):
             raise ValueError(
-                "Generator/head dimensions must match VAE latents."
+                f"Generator/head latent_dim must be {packed_dim} "
+                "(VAE latent dimension * latent_pack_size)."
             )
         if self.flow_head.condition_dim != self.generator.hidden_dim:
             raise ValueError(
@@ -271,10 +312,16 @@ class StreamModel(BaseModel):
                 dim=-1,
             )[0].float()
 
-            # Append END at the real end of each sequence, before padding.
-            sequences.append(
-                torch.cat((latent, self.end_latent[None]), dim=0)
-            )
+            # Repeat the last motion latent to fill a complete motion pack.
+            # These fill slots are supervised and decoded at inference.
+            pack_size = self.hparams.latent_pack_size
+            padding = (-len(latent)) % pack_size
+            if padding:
+                latent = torch.cat((latent, latent[-1:].expand(padding, -1)))
+            packed = latent.reshape(-1, self.generator.latent_dim)
+            # END occupies its own full pack, before masked batch padding.
+            end_pack = self.end_latent.repeat(pack_size)[None]
+            sequences.append(torch.cat((packed, end_pack), dim=0))
 
         targets = pad_sequence(sequences, batch_first=True)
         lengths = torch.tensor(
@@ -287,6 +334,46 @@ class StreamModel(BaseModel):
         )
 
         return targets, mask
+
+    @torch.no_grad()
+    def _two_forward_inputs(self, targets, mask, text, text_mask, language_ids):
+        motion = targets[:, :-1]
+        ratio = self.hparams.two_forward_max_ratio
+        warmup = self.hparams.two_forward_warmup_steps
+        if warmup:
+            progress = min(self.global_step / warmup, 1.0)
+            ratio *= 0.5 * (1.0 - math.cos(math.pi * progress))
+        if ratio == 0:
+            return motion
+
+        # Replace motion packs with a valid successor, including the final
+        # repeated motion pack. END and batch padding are excluded.
+        replace = torch.rand(motion.shape[:2], device=motion.device) < ratio
+        replace &= mask[:, :-1] & mask[:, 1:]
+        if not replace.any():
+            return motion
+
+        # Do not cache no-grad weight casts for the subsequent training pass.
+        with torch.autocast(
+            device_type=motion.device.type,
+            enabled=torch.is_autocast_enabled(motion.device.type),
+            dtype=torch.get_autocast_dtype(motion.device.type),
+            cache_enabled=False,
+        ):
+            first = self.generator(
+                motion, text, text_mask,
+                motion_mask=mask[:, :-1], language_ids=language_ids,
+            )
+            # Output position i predicts target pack_i, not pack_{i+1}.
+            conditions = first["condition"][:, :-1][replace]
+            del first
+            predictions = [
+                self.sample_latent(chunk, num_steps=self.hparams.two_forward_steps)
+                for chunk in conditions.split(self.hparams.two_forward_chunk_size)
+            ]
+        motion = motion.clone()
+        motion[replace] = torch.cat(predictions).to(motion)
+        return motion
 
     def train_forward(self, batch):
         text, text_mask, language_ids = self.encode_text(batch)
@@ -302,14 +389,43 @@ class StreamModel(BaseModel):
             text_mask = text_mask & ~drop_text[:, None]
 
         # StreamGenerator inserts BOS internally.
-        # Input:  BOS, z0, z1, ...
-        # Target: z0,  z1, ..., END
+        # Shift complete packs, so no target pack enters its own condition.
+        # Input:  BOS, pack0, pack1, ...
+        # Target: pack0, pack1, ..., independent END pack
+        motion_inputs = targets[:, :-1]
+        if self.training and self.hparams.two_forward_max_ratio > 0:
+            motion_inputs = self._two_forward_inputs(
+                targets, mask, text, text_mask, language_ids
+            )
+        history_noise_levels = None
+        if self.training and self._df_noise_levels.numel():
+            indices = torch.randint(
+                len(self._df_noise_levels), motion_inputs.shape[:2],
+                device=motion_inputs.device,
+            )
+            history_noise_levels = self._df_noise_levels[indices]
+            warmup = self.hparams.df_noise_warmup_steps
+            if warmup:
+                progress = min(self.global_step / warmup, 1.0)
+                history_noise_levels = history_noise_levels * (
+                    0.5 * (1.0 - math.cos(math.pi * progress))
+                )
+            # Only motion history is corrupted; END/padding and GT targets stay intact.
+            history_noise_levels = history_noise_levels.masked_fill(
+                ~(mask[:, :-1] & mask[:, 1:]), 0.0
+            )
+            strength = history_noise_levels[..., None]
+            motion_inputs = (
+                (1.0 - strength) * motion_inputs
+                + strength * torch.randn_like(motion_inputs)
+            )
         output = self.generator(
-            targets[:, :-1],
+            motion_inputs,
             text,
             text_mask,
             motion_mask=mask[:, :-1],
             language_ids=language_ids,
+            history_noise_levels=history_noise_levels,
         )
 
         # Remove padding before evaluating the flow head.
@@ -342,40 +458,69 @@ class StreamModel(BaseModel):
         }
 
     @torch.no_grad()
-    def sample_latent(self, condition, unconditional_condition=None):
+    def _flow_time_embeddings(self, batch_size, device, num_steps=None):
+        # Preserve each step's original batch shape: batching time steps
+        # together can change floating-point results during long rollouts.
+        steps = self.hparams.num_flow_steps if num_steps is None else num_steps
+        return torch.stack([
+            self.flow_head.time_embed(
+                torch.full((batch_size,), i / steps, device=device)
+            )
+            for i in range(steps)
+        ])
+
+    @torch.no_grad()
+    def sample_latent(
+        self, condition, unconditional_condition=None, time_embeddings=None,
+        num_steps=None,
+    ):
         scale = self.hparams.guidance_scale
         use_cfg = unconditional_condition is not None and scale != 1.0
         if use_cfg:
             if unconditional_condition.shape != condition.shape:
                 raise ValueError("CFG conditions must have matching shapes.")
             paired_condition = torch.cat((condition, unconditional_condition))
+        else:
+            paired_condition = condition
 
         x = torch.randn(
             condition.shape[0],
-            self.end_latent.numel(),
+            self.flow_head.latent_dim,
             device=condition.device,
             dtype=torch.float32,
         )
 
-        steps = self.hparams.num_flow_steps
+        steps = self.hparams.num_flow_steps if num_steps is None else num_steps
+        if not isinstance(steps, int) or steps < 1:
+            raise ValueError("num_steps must be a positive integer.")
+        if time_embeddings is None:
+            time_embeddings = self._flow_time_embeddings(
+                len(paired_condition), condition.device, steps
+            )
+        if (
+            time_embeddings.shape != (
+                steps, len(paired_condition), self.flow_head.input_proj.out_features
+            )
+            or time_embeddings.device != condition.device
+        ):
+            raise ValueError("Flow time embeddings must match steps, batch and device.")
+
+        projected_condition = self.flow_head.condition_proj(
+            paired_condition.to(self.flow_head.input_proj.weight.dtype)
+        )
 
         # Euler integration from noise (t=0) to motion latent (t=1).
         for i in range(steps):
-            t = torch.full(
-                (len(x),),
-                i / steps,
-                device=x.device,
-            )
+            context = time_embeddings[i] + projected_condition
             if use_cfg:
                 # Both branches evaluate the same noisy latent and flow time.
-                velocity_c, velocity_u = self.flow_head(
+                velocity_c, velocity_u = self.flow_head.forward_with_context(
                     torch.cat((x, x)),
-                    torch.cat((t, t)),
-                    paired_condition,
+                    context,
                 ).float().chunk(2)
                 velocity = velocity_u + scale * (velocity_c - velocity_u)
             else:
-                velocity = self.flow_head(x, t, condition)
+                velocity = self.flow_head.forward_with_context(x, context)
             x = x + velocity.float() / steps
 
         return x
@@ -389,6 +534,10 @@ class StreamModel(BaseModel):
         text, text_mask, language_ids = self.encode_text(batch)
         batch_size = text.shape[0]
         limit = self.hparams.max_new_tokens
+        # Generation limits retain their original (unpacked) latent units.
+        pack_size = self.hparams.latent_pack_size
+        pack_limit = (limit + pack_size - 1) // pack_size
+        end_pack = self.end_latent.repeat(pack_size)
         end_mode = self.hparams.end_mode
         use_cfg = self.hparams.guidance_scale != 1.0
         if use_cfg:
@@ -400,7 +549,7 @@ class StreamModel(BaseModel):
 
         output = self.generator(
             text.new_empty(
-                text.shape[0], 0, self.end_latent.numel()
+                text.shape[0], 0, self.generator.latent_dim
             ),
             text,
             text_mask,
@@ -410,8 +559,8 @@ class StreamModel(BaseModel):
 
         latents = torch.zeros(
             batch_size,
-            limit,
-            self.end_latent.numel(),
+            pack_limit,
+            self.generator.latent_dim,
             device=self.device,
         )
         lengths = torch.zeros(
@@ -420,44 +569,53 @@ class StreamModel(BaseModel):
         finished = torch.zeros(
             batch_size, dtype=torch.bool, device=self.device
         )
+        # Local to this generation call; never reused after a weight, device,
+        # precision, or sampling configuration change.
+        time_embeddings = self._flow_time_embeddings(text.shape[0], text.device)
 
-        # Classifier modes also inspect END after the final allowed motion.
-        for i in range(limit + int(end_mode != "latent")):
+        # Inspect the next END after a full final pack, as in unpacked mode.
+        # A cap inside a pack must not feed its discarded slots into history.
+        inspect_final_end = end_mode != "latent" and limit % pack_size == 0
+        for i in range(pack_limit + int(inspect_final_end)):
             condition = output["condition"][:, -1]
             if use_cfg:
                 condition, unconditional_condition = condition.chunk(2)
 
-            can_finish = lengths >= self.hparams.min_new_tokens
+            can_finish = lengths * pack_size >= self.hparams.min_new_tokens
             if end_mode != "latent":
                 # END uses the conditional branch, without CFG extrapolation.
                 end_prob = output["end_logits"][:batch_size, -1].float().sigmoid()
                 finished |= can_finish & (end_prob >= self.hparams.end_prob_threshold)
 
-            if finished.all() or (i == limit and end_mode == "classifier"):
+            if finished.all() or (i == pack_limit and end_mode == "classifier"):
                 break
 
             if use_cfg:
-                latent = self.sample_latent(condition, unconditional_condition)
+                latent = self.sample_latent(
+                    condition, unconditional_condition, time_embeddings
+                )
             else:
-                latent = self.sample_latent(condition)
+                latent = self.sample_latent(condition, time_embeddings=time_embeddings)
 
             if not torch.isfinite(latent).all():
                 raise RuntimeError("Non-finite generated latent.")
-
             if end_mode != "classifier":
-                distance = (latent - self.end_latent).norm(dim=-1)
+                # Compare the complete END pack. Normalize for pack size so
+                # the threshold retains its original latent-distance scale.
+                distance = (latent - end_pack).norm(dim=-1) / math.sqrt(pack_size)
                 finished |= can_finish & (distance <= self.hparams.end_threshold)
 
-            if i == limit:
+            if i == pack_limit:
                 break
 
             active = ~finished
-
-            # Exclude END and all positions after termination.
+            # END is excluded as a whole; retain all motion-pack fill slots.
             latents[:, i] = latent.masked_fill(~active[:, None], 0)
             lengths += active.long()
 
-            if finished.all() or (i + 1 == limit and end_mode == "latent"):
+            if finished.all() or (
+                i + 1 == pack_limit and (end_mode == "latent" or limit % pack_size != 0)
+            ):
                 break
 
             motion_input = latents[:, i:i + 1]
@@ -471,14 +629,16 @@ class StreamModel(BaseModel):
                 past_key_values=output["past_key_values"],
                 past_mask=output["attention_mask"],
                 use_cache=True,
+                text_cache=output["text_cache"],
             )
 
         motions = []
+        # Keep the hard cap in original latent units, even inside a pack.
+        latent_lengths = (lengths * pack_size).clamp_max(limit)
 
-        for z, length in zip(latents, lengths.tolist()):
+        for z, length in zip(latents, latent_lengths.tolist()):
             body, left, right = (
-                z[:length]
-                .unsqueeze(0)
+                z.reshape(1, -1, self.end_latent.numel())[:, :length]
                 .split(self.latent_dims, dim=-1)
             )
 
@@ -500,7 +660,7 @@ class StreamModel(BaseModel):
         return {
             "feats_rst": pad_sequence(motions, batch_first=True),
             "lengths_rst": (
-                lengths * self.temporal_factor
+                latent_lengths * self.temporal_factor
             ).tolist(),
             "finished": finished,
         }

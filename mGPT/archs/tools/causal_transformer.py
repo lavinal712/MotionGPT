@@ -1,3 +1,4 @@
+import math
 from typing import Optional, Tuple
 
 import torch
@@ -247,6 +248,103 @@ class CausalSelfAttention(nn.Module):
         return output, present_key_value
 
 
+class TextCrossAttention(nn.Module):
+    """Text attention with an optional learned-center Gaussian position bias.
+
+    Local mode is soft, dense attention, not a sparse or monotonic window.
+    Text K/V can be projected once and reused throughout a generation call.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        text_dim: int,
+        num_heads: int,
+        attention_type: str = "local",
+        sigma: float = 8.0,
+        dropout: float = 0.0,
+        qk_norm: bool = True,
+        norm_eps: float = 1e-6,
+        bias: bool = False,
+    ):
+        super().__init__()
+        if min(hidden_dim, text_dim, num_heads) <= 0 or hidden_dim % num_heads:
+            raise ValueError("Invalid cross-attention dimensions.")
+        if attention_type not in ("global", "local"):
+            raise ValueError("attention_type must be global or local.")
+        if not math.isfinite(sigma) or sigma <= 0:
+            raise ValueError("Cross-attention sigma must be finite and positive.")
+        if not 0 <= dropout < 1:
+            raise ValueError("dropout must be in [0, 1).")
+
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.sigma = sigma
+        self.dropout = dropout
+        self.text_norm = RMSNorm(text_dim, norm_eps)
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim, bias=bias)
+        self.kv_proj = nn.Linear(text_dim, 2 * hidden_dim, bias=bias)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim, bias=bias)
+        self.q_norm = RMSNorm(self.head_dim, norm_eps) if qk_norm else nn.Identity()
+        self.k_norm = RMSNorm(self.head_dim, norm_eps) if qk_norm else nn.Identity()
+        self.center_proj = nn.Linear(hidden_dim, 1) if attention_type == "local" else None
+
+    def project_text(self, text: Tensor, text_mask: Tensor) -> KVCache:
+        if text_mask.dtype != torch.bool or text_mask.shape != text.shape[:2]:
+            raise ValueError("text_mask must be bool [B, L].")
+        batch_size, length, _ = text.shape
+        if length == 0:
+            raise ValueError("Text memory needs at least one (possibly masked) token.")
+        text = self.text_norm(text.masked_fill(~text_mask[..., None], 0.0))
+        kv = self.kv_proj(text.to(self.kv_proj.weight.dtype)).reshape(
+            batch_size, length, 2, self.num_heads, self.head_dim
+        )
+        k, v = kv.unbind(dim=2)
+        return self.k_norm(k.transpose(1, 2)), v.transpose(1, 2)
+
+    def forward(self, x: Tensor, text_key_value: KVCache, text_mask: Tensor) -> Tensor:
+        batch_size, query_length, hidden_dim = x.shape
+        k, v = text_key_value
+        if (
+            k.ndim != 4 or k.shape != v.shape
+            or k.shape[:2] != (batch_size, self.num_heads)
+            or k.shape[-1] != self.head_dim or k.shape[-2] == 0
+            or text_mask.dtype != torch.bool
+            or text_mask.shape != (batch_size, k.shape[-2])
+        ):
+            raise ValueError("Text cache and mask must match the cross-attention batch.")
+        q = self.q_proj(x.to(self.q_proj.weight.dtype)).reshape(
+            batch_size, query_length, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        q = self.q_norm(q)
+
+        # CFG/text dropout may hide every key. Use a finite fallback and then
+        # zero the complete projected residual, including any output bias.
+        has_text = text_mask.any(dim=-1)
+        fallback = torch.arange(k.shape[-2], device=x.device).eq(0)
+        visible = text_mask | (~has_text[:, None] & fallback[None])
+        attention_mask = visible[:, None, None, :]
+        if self.center_proj is not None:
+            center = self.center_proj(x.to(self.center_proj.weight.dtype)).float().sigmoid()
+            center = center * (text_mask.sum(-1) - 1).clamp_min(0)[:, None, None]
+            ranks = (text_mask.long().cumsum(-1) - 1).clamp_min(0).float()
+            distance = (ranks[:, None, :] - center) / self.sigma
+            attention_mask = (-0.5 * distance.square())[:, None].masked_fill(
+                ~attention_mask, float("-inf")
+            ).to(q.dtype)
+
+        output = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attention_mask,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=False,
+        )
+        output = output.transpose(1, 2).contiguous().reshape(
+            batch_size, query_length, hidden_dim
+        )
+        output = self.out_proj(output)
+        return output.masked_fill(~has_text[:, None, None], 0.0)
+
+
 class FeedForward(nn.Module):
     """SwiGLU feed-forward network."""
 
@@ -280,7 +378,7 @@ class FeedForward(nn.Module):
 
 
 class CausalTransformerBlock(nn.Module):
-    """Pre-norm causal Transformer block."""
+    """Pre-norm self-attention, optional motion-to-text attention, then FFN."""
 
     def __init__(
         self,
@@ -292,6 +390,9 @@ class CausalTransformerBlock(nn.Module):
         rope_base: float = 10000.0,
         norm_eps: float = 1e-6,
         bias: bool = False,
+        text_dim: Optional[int] = None,
+        cross_attention_type: Optional[str] = None,
+        cross_attention_sigma: float = 8.0,
     ):
         super().__init__()
 
@@ -305,6 +406,17 @@ class CausalTransformerBlock(nn.Module):
             norm_eps=norm_eps,
             bias=bias,
         )
+        self.cross_attention = None
+        if cross_attention_type is not None:
+            if text_dim is None:
+                raise ValueError("text_dim is required for cross-attention.")
+            self.cross_attention_norm = RMSNorm(hidden_dim, norm_eps)
+            self.cross_attention = TextCrossAttention(
+                hidden_dim, text_dim, num_heads,
+                attention_type=cross_attention_type,
+                sigma=cross_attention_sigma, dropout=dropout,
+                qk_norm=qk_norm, norm_eps=norm_eps, bias=bias,
+            )
         self.ffn_norm = RMSNorm(hidden_dim, norm_eps)
         self.feed_forward = FeedForward(
             hidden_dim=hidden_dim,
@@ -321,6 +433,9 @@ class CausalTransformerBlock(nn.Module):
         position_ids: Optional[Tensor] = None,
         past_key_value: Optional[KVCache] = None,
         use_cache: bool = False,
+        text_key_value: Optional[KVCache] = None,
+        text_mask: Optional[Tensor] = None,
+        cross_query_start: int = 0,
     ) -> Tuple[Tensor, Optional[KVCache]]:
         attention_output, present_key_value = self.attention(
             self.attention_norm(x),
@@ -331,6 +446,16 @@ class CausalTransformerBlock(nn.Module):
             use_cache=use_cache,
         )
         x = x + self.residual_dropout(attention_output)
+        if self.cross_attention is not None:
+            if text_key_value is None or text_mask is None:
+                raise ValueError("Cross-attention requires text K/V and mask.")
+            # In full forward, leave language/text prefix rows unchanged.
+            motion = x[:, cross_query_start:]
+            residual = self.cross_attention(
+                self.cross_attention_norm(motion), text_key_value, text_mask
+            )
+            x = torch.cat((x[:, :cross_query_start],
+                           motion + self.residual_dropout(residual)), dim=1)
         x = x + self.residual_dropout(
             self.feed_forward(self.ffn_norm(x))
         )

@@ -1,4 +1,4 @@
-NAME: STREAM_CLASSIFIER
+NAME: STREAM_CA6_P2_T1024_F1024
 DEBUG: false
 FULL_CONFIG: false
 
@@ -129,6 +129,18 @@ stream_params:
   # Initial inference cap, not a training-length restriction.
   # Revisit after measuring the actual motion-length distribution.
   max_new_tokens: 256
+
+  # Two-Foward
+  two_forward_max_ratio: 0.5
+  two_forward_warmup_steps: 10000
+  two_forward_steps: 4
+  two_forward_chunk_size: 256
+
+  # DF-inspired history corruption; [] disables it for ablation.
+  df_noise_levels: [0.0, 0.1, 0.3, 0.6]
+  df_noise_warmup_steps: 10000
+
+  latent_pack_size: 2
 
 model:
   target: mGPT.models.mgpt_stream.StreamModel
